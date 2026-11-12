@@ -1,35 +1,52 @@
 """
-PSN Gift Card Stock Monitor (for Render / Railway / any server)
+PSN Gift Card FAST Monitor (Railway / any always-on server)
 
-- Checks every product every CHECK_INTERVAL seconds.
-- INSTANT Telegram alert when an item goes from not-in-stock to in-stock.
-- Hourly Telegram status report listing every product: name, price, status, link.
+- Every site is checked in its own loop, in parallel (default every ~5 s for normal
+  sites, ~15 s for JavaScript sites that need a real browser).
+- The moment something comes IN STOCK you get a loud, highlighted alert, repeated
+  every REPEAT_ALERT seconds until it sells out.
+- A status report (grouped by PRICE) goes out every REPORT_INTERVAL seconds (default 60).
 
-Secrets are read from environment variables (do NOT hard-code them on GitHub):
-  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-Optional: CHECK_INTERVAL (default 90), REPORT_INTERVAL (default 3600), MAX_PRICE
+Railway variables
+  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID   required (chat id can be comma-separated)
+  PRODUCT_URLS      optional: extra product links separated by spaces/commas/new lines
+  MAX_PRICE         optional: ignore listings above this price (scalper filter)
+  FAST_INTERVAL     default 5     seconds between checks, normal sites
+  BROWSER_INTERVAL  default 15    seconds between rounds, browser sites
+  REPORT_INTERVAL   default 60    seconds between status reports
+  REPEAT_ALERT      default 30    seconds between repeat "IN STOCK" alerts
 """
 
+import html as H
 import json
 import os
 import random
 import re
+import threading
 import time
+
 import requests
 from bs4 import BeautifulSoup
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "90"))
-REPORT_INTERVAL = int(os.getenv("REPORT_INTERVAL", "3600"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "0")) or None  # 0 = no limit
+FAST_INTERVAL = float(os.getenv("FAST_INTERVAL", "5"))
+BROWSER_INTERVAL = float(os.getenv("BROWSER_INTERVAL", "15"))
+REPORT_INTERVAL = int(os.getenv("REPORT_INTERVAL", "60"))
+REPEAT_ALERT = int(os.getenv("REPEAT_ALERT", "30"))
+RENDER_WAIT_MS = int(os.getenv("RENDER_WAIT_MS", "2500"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "0")) or None
 
-# Paste exact product-page links here (add Amazon, Flipkart, JioStore, PlayStation Direct...)
+# ---- Add product-page links here (or in the PRODUCT_URLS variable on Railway) ----
 PRODUCTS = [
     "https://www.gamestheshop.com/product/2153a461-7203-4802-aac4-283be4c775d3?variant=09df672e-b598-4b2d-9b3e-e1ca1dd9d205",
     "https://www.gamestheshop.com/product/d117bc23-1c4b-4330-b7f3-f90c71d9a5b3?variant=cb05d659-beac-47d7-85ff-8bfed95f47cf",
     # "https://mdcomputers.in/product/sony-playstation-gift-card-inr-1000",
+    # "https://www.amazon.in/dp/XXXXXXXXXX",
+    # "https://www.flipkart.com/....",
 ]
+PRODUCTS += [u for u in re.split(r"[\s,]+", os.getenv("PRODUCT_URLS", "")) if u.startswith("http")]
+PRODUCTS = list(dict.fromkeys(PRODUCTS))  # remove duplicates, keep order
 
 # Sites that load content with JavaScript -> opened in a real headless browser
 BROWSER_SITES = ["gamestheshop.com"]
@@ -37,46 +54,15 @@ BROWSER_SITES = ["gamestheshop.com"]
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 HEADERS = {"User-Agent": UA, "Accept-Language": "en-IN,en;q=0.9"}
-
 OUT_WORDS = ["out of stock", "sold out", "currently unavailable", "notify me",
              "coming soon", "temporarily unavailable"]
 IN_WORDS = ["add to cart", "buy now", "add to bag"]
 
-_pw = None
-_browser = None
+state = {}
+lock = threading.Lock()
 
 
-def get_browser():
-    global _pw, _browser
-    if _browser is None:
-        from playwright.sync_api import sync_playwright
-        _pw = sync_playwright().start()
-        _browser = _pw.chromium.launch(headless=True, args=["--no-sandbox"])
-    return _browser
-
-
-def reset_browser():
-    global _pw, _browser
-    try:
-        if _browser:
-            _browser.close()
-        if _pw:
-            _pw.stop()
-    except Exception:
-        pass
-    _pw = _browser = None
-
-
-def fetch_rendered(url):
-    page = get_browser().new_page(user_agent=UA)
-    try:
-        page.goto(url, wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(2000)
-        return page.content()
-    finally:
-        page.close()
-
-
+# ---------------- parsing ----------------
 def parse_price(text):
     m = re.search(r"[\d,]+(?:\.\d+)?", text or "")
     return float(m.group(0).replace(",", "")) if m else None
@@ -106,17 +92,9 @@ def jsonld_offers(soup):
     return None
 
 
-def check(url):
-    if any(d in url for d in BROWSER_SITES):
-        html = fetch_rendered(url)
-    else:
-        r = requests.get(url, headers=HEADERS, timeout=25)
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code}")
-        html = r.text
+def check_html(html, url):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True).lower()
-
     name = (soup.find("title").get_text(strip=True) if soup.find("title") else url)[:100]
     price, in_stock = None, None
 
@@ -147,20 +125,21 @@ def check(url):
         m = re.search(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)", text)
         if m:
             price = parse_price(m.group(1))
-
     return {"name": name, "price": price, "in_stock": in_stock}
 
 
-def telegram(msg):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000],
-                  "disable_web_page_preview": True},
-            timeout=15,
-        )
-    except Exception as e:
-        print("Telegram error:", e)
+# ---------------- telegram ----------------
+def telegram(msg, html=True):
+    for chat_id in [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]:
+        try:
+            data = {"chat_id": chat_id, "text": msg[:4000], "disable_web_page_preview": True}
+            if html:
+                data["parse_mode"] = "HTML"
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          data=data, timeout=15)
+        except Exception as e:
+            print("Telegram error:", e)
+        time.sleep(0.3)  # stay under Telegram rate limits
 
 
 def site_of(url):
@@ -168,69 +147,176 @@ def site_of(url):
 
 
 def fmt_price(p):
-    return f"₹{p:,.0f}" if p else "price not found"
+    return f"₹{p:,.0f}" if p else "price unknown"
 
 
-def status_label(s):
-    return "✅ IN STOCK" if s is True else ("❌ Out of stock" if s is False else "⚠️ Unknown")
+def alert_text(url, s, repeat=False):
+    tag = "STILL IN STOCK" if repeat else "IN STOCK — BUY NOW!"
+    return (f"🚨🚨🚨 <b>{tag}</b> 🚨🚨🚨\n\n"
+            f"🎮 <b>{H.escape(s['name'])}</b>\n"
+            f"💰 <b>Price: {fmt_price(s['price'])}</b>\n"
+            f"🏪 {H.escape(site_of(url))}\n\n"
+            f"👉 <a href=\"{H.escape(url)}\"><b>OPEN &amp; BUY NOW</b></a> 👈\n"
+            f"🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥")
 
 
-def hourly_report(state):
-    lines = [f"🕐 Hourly PSN status ({time.strftime('%d %b, %H:%M')} server time)\n"]
+# ---------------- state / alerts ----------------
+def too_pricey(info):
+    return bool(MAX_PRICE and info["price"] and info["price"] > MAX_PRICE)
+
+
+def record(url, info):
+    send_alert = send_gone = False
+    with lock:
+        old = state.get(url, {})
+        prev = old.get("in_stock")
+        s = {**info, "error": None, "checked": time.time(),
+             "last_alert": old.get("last_alert", 0)}
+        if info["in_stock"] and prev is not True and not too_pricey(info):
+            send_alert = True
+            s["last_alert"] = time.time()
+        if prev is True and info["in_stock"] is False:
+            send_gone = True
+        state[url] = s
+        snap = dict(s)
+    print(f"[{time.strftime('%H:%M:%S')}] {site_of(url)} | "
+          f"{'IN STOCK' if info['in_stock'] else 'out/unknown'} | {fmt_price(info['price'])}")
+    if send_alert:
+        telegram(alert_text(url, snap))
+    if send_gone:
+        telegram(f"❌ Sold out again: <b>{H.escape(snap['name'])}</b> ({H.escape(site_of(url))})")
+
+
+def record_error(url, e):
+    print(f"Error on {url}: {e}")
+    with lock:
+        old = state.get(url, {"name": site_of(url), "price": None,
+                              "in_stock": None, "last_alert": 0})
+        state[url] = {**old, "error": str(e)[:80], "checked": time.time()}
+
+
+def repeater():
+    """Re-sends the highlighted alert while an item stays in stock."""
+    while True:
+        time.sleep(3)
+        due = []
+        with lock:
+            for url, s in state.items():
+                if (s.get("in_stock") is True and not too_pricey(s)
+                        and time.time() - s.get("last_alert", 0) >= REPEAT_ALERT):
+                    s["last_alert"] = time.time()
+                    due.append((url, dict(s)))
+        for url, s in due:
+            telegram(alert_text(url, s, repeat=True))
+
+
+def report():
+    with lock:
+        snap = {u: dict(s) for u, s in state.items()}
+    groups = {}
     for url in PRODUCTS:
-        s = state.get(url)
-        if not s:
-            lines.append(f"• Not checked yet\n  {url}\n")
-            continue
-        err = f"\n  ⚠️ Last error: {s['error']}" if s.get("error") else ""
-        lines.append(
-            f"• {s['name']}\n"
-            f"  {status_label(s['in_stock'])} | {fmt_price(s['price'])} | {site_of(url)}\n"
-            f"  🔗 {url}{err}\n"
-        )
+        s = snap.get(url)
+        key = round(s["price"]) if s and s.get("price") else None
+        groups.setdefault(key, []).append((url, s))
+    in_count = sum(1 for s in snap.values() if s.get("in_stock") is True)
+    lines = [f"📊 <b>PSN status</b> {time.strftime('%H:%M:%S')}  |  "
+             f"In stock: <b>{in_count}/{len(PRODUCTS)}</b>"]
+    for key in sorted(groups, key=lambda k: (k is None, k or 0)):
+        lines.append(f"\n💰 <b>{'₹{:,}'.format(key) if key else 'Price unknown'}</b>")
+        for url, s in groups[key]:
+            site = H.escape(site_of(url))
+            if not s:
+                lines.append(f"  ⏳ <a href=\"{H.escape(url)}\">{site}</a> — not checked yet")
+                continue
+            icon = "✅ IN STOCK" if s["in_stock"] is True else (
+                "❌ Out" if s["in_stock"] is False else "⚠️ Unknown")
+            err = " (error)" if s.get("error") else ""
+            lines.append(f"  {icon} — <a href=\"{H.escape(url)}\">{site}</a>{err}")
     telegram("\n".join(lines))
+
+
+def reporter():
+    time.sleep(25)
+    while True:
+        try:
+            report()
+        except Exception as e:
+            print("report error:", e)
+        time.sleep(REPORT_INTERVAL)
+
+
+# ---------------- workers ----------------
+def plain_worker(url):
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    while True:
+        try:
+            r = sess.get(url, timeout=20)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            record(url, check_html(r.text, url))
+        except Exception as e:
+            record_error(url, e)
+        time.sleep(FAST_INTERVAL * random.uniform(0.8, 1.3))
+
+
+def browser_worker(urls):
+    pw = browser = None
+    while True:
+        for url in urls:
+            try:
+                if browser is None:
+                    from playwright.sync_api import sync_playwright
+                    pw = sync_playwright().start()
+                    browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+                page = browser.new_page(user_agent=UA)
+                try:
+                    # skip images/fonts/video so pages load faster
+                    page.route("**/*", lambda route: route.abort()
+                               if route.request.resource_type in ("image", "media", "font")
+                               else route.continue_())
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(RENDER_WAIT_MS)
+                    html = page.content()
+                finally:
+                    page.close()
+                record(url, check_html(html, url))
+            except Exception as e:
+                record_error(url, e)
+                try:
+                    if browser:
+                        browser.close()
+                    if pw:
+                        pw.stop()
+                except Exception:
+                    pass
+                pw = browser = None
+            time.sleep(random.uniform(0.5, 1.5))
+        time.sleep(BROWSER_INTERVAL)
 
 
 def main():
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        raise SystemExit("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID environment variables.")
+        raise SystemExit("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID.")
     if not PRODUCTS:
-        raise SystemExit("Add product links to PRODUCTS.")
+        raise SystemExit("Add product links to PRODUCTS or PRODUCT_URLS.")
 
-    state = {}
-    telegram(f"✅ PSN monitor started. Watching {len(PRODUCTS)} link(s). "
-             f"Alerts are instant; status report every {REPORT_INTERVAL // 60} min.")
-    last_report = 0
+    browser_urls = [u for u in PRODUCTS if any(d in u for d in BROWSER_SITES)]
+    plain_urls = [u for u in PRODUCTS if u not in browser_urls]
 
+    telegram(f"✅ <b>Fast PSN monitor started</b>\n"
+             f"Watching {len(PRODUCTS)} link(s): {len(plain_urls)} fast, "
+             f"{len(browser_urls)} browser.\n"
+             f"Report every {REPORT_INTERVAL}s. Stock alerts are instant.")
+
+    for u in plain_urls:
+        threading.Thread(target=plain_worker, args=(u,), daemon=True).start()
+    if browser_urls:
+        threading.Thread(target=browser_worker, args=(browser_urls,), daemon=True).start()
+    threading.Thread(target=repeater, daemon=True).start()
+    threading.Thread(target=reporter, daemon=True).start()
     while True:
-        for url in PRODUCTS:
-            prev = state.get(url, {}).get("in_stock")
-            try:
-                info = check(url)
-                state[url] = {**info, "error": None}
-                print(f"[{time.strftime('%H:%M:%S')}] {site_of(url)} | "
-                      f"{status_label(info['in_stock'])} | {fmt_price(info['price'])}")
-
-                too_pricey = MAX_PRICE and info["price"] and info["price"] > MAX_PRICE
-                if info["in_stock"] and prev is not True and not too_pricey:
-                    telegram(
-                        f"🎮🚨 IN STOCK NOW!\n\n{info['name']}\n"
-                        f"💰 Price: {fmt_price(info['price'])}\n"
-                        f"🏪 Site: {site_of(url)}\n\n🔗 {url}"
-                    )
-            except Exception as e:
-                print(f"Error on {url}: {e}")
-                old = state.get(url, {"name": url, "price": None, "in_stock": None})
-                state[url] = {**old, "error": str(e)[:120]}
-                if any(d in url for d in BROWSER_SITES):
-                    reset_browser()
-            time.sleep(random.uniform(2, 5))
-
-        if time.time() - last_report >= REPORT_INTERVAL:
-            hourly_report(state)
-            last_report = time.time()
-
-        time.sleep(CHECK_INTERVAL + random.uniform(0, 15))
+        time.sleep(60)
 
 
 if __name__ == "__main__":
