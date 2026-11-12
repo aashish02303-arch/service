@@ -50,6 +50,7 @@ PRODUCTS = list(dict.fromkeys(PRODUCTS))  # remove duplicates, keep order
 
 # Sites that load content with JavaScript -> opened in a real headless browser
 BROWSER_SITES = ["gamestheshop.com"]
+BROWSER_SITES += [d for d in re.split(r"[\s,]+", os.getenv("BROWSER_SITES", "")) if d]  # e.g. croma.com,vijaysales.com
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
