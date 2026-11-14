@@ -50,7 +50,28 @@ PRODUCTS += [u for u in re.split(r"[\s,]+", os.getenv("PRODUCT_URLS", "")) if u.
 # Links you care about most: checked faster and shown first in every report.
 PRIORITY_URLS = [u for u in re.split(r"[\s,]+", os.getenv("PRIORITY_URLS", "")) if u.startswith("http")]
 PRODUCTS += PRIORITY_URLS
-PRODUCTS = list(dict.fromkeys(PRODUCTS))  # remove duplicates, keep order
+
+
+def normalize_url(u):
+    """Strip tracking text so the same product isn't added twice."""
+    from urllib.parse import urlparse, parse_qs
+    p = urlparse(u)
+    host = p.netloc.lower().removeprefix("www.")
+    if host == "flipkart.com":
+        pid = parse_qs(p.query).get("pid", [""])[0]
+        return f"https://www.flipkart.com{p.path}" + (f"?pid={pid}" if pid else "")
+    if host.startswith("amazon."):
+        m = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", p.path)
+        if m:
+            return f"https://www.{host}/dp/{m.group(1)}"
+    return u.split("#")[0]
+
+
+PRODUCTS = list(dict.fromkeys(normalize_url(u) for u in PRODUCTS))
+PRIORITY_URLS = list(dict.fromkeys(normalize_url(u) for u in PRIORITY_URLS))
+
+# Some sites block fast checkers. These sites are never checked faster than this (seconds).
+SITE_MIN_INTERVAL = {"flipkart.com": 10, "amazon.in": 10, "croma.com": 15, "vijaysales.com": 10}
 
 # Sites that load content with JavaScript -> opened in a real headless browser
 BROWSER_SITES = ["gamestheshop.com"]
@@ -289,6 +310,19 @@ LINE = "━━━━━━━━━━━━━━━━━━"
 RECENT_LIVE_SECS = 1800  # "was live X min ago" signal window
 
 
+def reason(err):
+    e = str(err or "")
+    if "429" in e:
+        return "rate-limited (slowing down)"
+    if "403" in e or "bot check" in e:
+        return "blocked by the site"
+    if "HTTP 5" in e:
+        return "site error"
+    if "imeout" in e or "timed out" in e:
+        return "timeout"
+    return e[:40] or "no data yet"
+
+
 def pretty_site(url):
     d = site_of(url)
     return SITE_NAMES.get(d, d.split(".")[0].title() if d.count(".") < 2 else d)
@@ -366,14 +400,14 @@ def report():
 
     # 2) priority watch
     if PRIORITY_URLS:
-        L.append(f"\n🎯 <b>PRIORITY WATCH</b>  <i>(every {PRIORITY_INTERVAL:g}s)</i>")
+        L.append("\n🎯 <b>PRIORITY WATCH</b>  <i>(checked fastest)</i>")
         for i, u in enumerate(PRIORITY_URLS):
             s = S.get(u)
             medal = RANK[i] if i < len(RANK) else "▪️"
             if not s:
                 L.append(f"{medal} {link(u)} — ⏳ starting…")
             elif not readable(s):
-                L.append(f"{medal} {link(u)} — ⚪ can't read page")
+                L.append(f"{medal} {link(u)} — ⚪ {reason(s.get('error'))}")
             else:
                 L.append(f"{medal} <b>{fmt_price(s['price'])}</b> · {link(u)}\n"
                          f"      {state_text(s)}  <i>· {ago(s)}</i>")
@@ -404,6 +438,15 @@ def report():
         head = f"₹{key:,}" if key else "₹?"
         L.append(f"<b>{head}</b>  " + "  ".join(cells))
 
+    if unk:
+        counts = {}
+        for u in unk:
+            k = (pretty_site(u), reason(S[u].get("error") if S[u] else None))
+            counts[k] = counts.get(k, 0) + 1
+        L.append("\n⚠️ <b>PROBLEMS</b>")
+        for (n, why), c in counts.items():
+            L.append(f"⚪ {n}" + (f" ×{c}" if c > 1 else "") + f" — {why}")
+
     L += [LINE, "🟢 live  🟡 soon  🔴 out  ⚪ can't read", f"🔁 next update in {REPORT_INTERVAL}s"]
     telegram("\n".join(L))
 
@@ -423,12 +466,19 @@ def plain_worker(url):
     sess = requests.Session()
     sess.headers.update(HEADERS)
     base = PRIORITY_INTERVAL if url in PRIORITY_URLS else FAST_INTERVAL
+    for dom, floor in SITE_MIN_INTERVAL.items():
+        if dom in url:
+            base = max(base, floor)
     errors = 0
     while True:
         try:
             r = sess.get(url, timeout=20)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}")
+            low = r.text.lower()
+            if any(w in low for w in ("captcha", "verify you are human",
+                                      "security verification", "access denied")):
+                raise RuntimeError("bot check")
             record(url, check_html(r.text, url))
             errors = 0
         except Exception as e:
