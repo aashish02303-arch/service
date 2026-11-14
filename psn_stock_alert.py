@@ -475,10 +475,15 @@ def plain_worker(url):
             r = sess.get(url, timeout=20)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}")
-            low = r.text.lower()
-            if any(w in low for w in ("captcha", "verify you are human",
-                                      "security verification", "access denied")):
-                raise RuntimeError("bot check")
+            tm = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.I | re.S)
+            title = re.sub(r"\s+", " ", tm.group(1)).strip() if tm else ""
+            # Only call it a bot check if the PAGE TITLE says so (or the page is tiny and
+            # says so). Normal pages mention "captcha" inside scripts, which is not a block.
+            if (re.search(r"just a moment|attention required|access denied|captcha|"
+                          r"are you a (human|robot)|verify|security check", title, re.I)
+                    or (len(r.text) < 15000 and re.search(
+                        r"captcha|verify you are human|access denied", r.text, re.I))):
+                raise RuntimeError(f"bot check: {title[:60] or 'tiny page'}")
             record(url, check_html(r.text, url))
             errors = 0
         except Exception as e:
