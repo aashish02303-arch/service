@@ -36,6 +36,7 @@ REPORT_INTERVAL = int(os.getenv("REPORT_INTERVAL", "60"))
 REPEAT_ALERT = int(os.getenv("REPEAT_ALERT", "30"))
 RENDER_WAIT_MS = int(os.getenv("RENDER_WAIT_MS", "2500"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0")) or None
+PRIORITY_INTERVAL = float(os.getenv("PRIORITY_INTERVAL", "3"))  # seconds, priority links
 
 # ---- Add product-page links here (or in the PRODUCT_URLS variable on Railway) ----
 PRODUCTS = [
@@ -46,6 +47,9 @@ PRODUCTS = [
     # "https://www.flipkart.com/....",
 ]
 PRODUCTS += [u for u in re.split(r"[\s,]+", os.getenv("PRODUCT_URLS", "")) if u.startswith("http")]
+# Links you care about most: checked faster and shown first in every report.
+PRIORITY_URLS = [u for u in re.split(r"[\s,]+", os.getenv("PRIORITY_URLS", "")) if u.startswith("http")]
+PRODUCTS += PRIORITY_URLS
 PRODUCTS = list(dict.fromkeys(PRODUCTS))  # remove duplicates, keep order
 
 # Sites that load content with JavaScript -> opened in a real headless browser
@@ -126,7 +130,20 @@ def check_html(html, url):
         m = re.search(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)", text)
         if m:
             price = parse_price(m.group(1))
-    return {"name": name, "price": price, "in_stock": in_stock}
+
+    # What exactly does the page say? (used to spot "coming soon" / "notify me" changes)
+    label = None
+    if in_stock is not True:
+        if "coming soon" in text:
+            label = "COMING SOON"
+        elif "sold out" in text:
+            label = "SOLD OUT"
+        elif any(w in text for w in ("out of stock", "currently unavailable",
+                                     "temporarily unavailable")):
+            label = "OUT OF STOCK"
+        elif "notify me" in text:
+            label = "NOTIFY ME"
+    return {"name": name, "price": price, "in_stock": in_stock, "label": label}
 
 
 # ---------------- telegram ----------------
@@ -166,13 +183,51 @@ def too_pricey(info):
     return bool(MAX_PRICE and info["price"] and info["price"] > MAX_PRICE)
 
 
+OUT_LABELS = ("COMING SOON", "NOTIFY ME", "SOLD OUT", "OUT OF STOCK")
+LABEL_TEXT = {"COMING SOON": "🕒 Coming soon", "NOTIFY ME": "❌ Out (Notify me)",
+              "SOLD OUT": "❌ Sold out", "OUT OF STOCK": "❌ Out"}
+
+
+def change_text(url, s, old_label, new_label):
+    link = f"<a href=\"{H.escape(url)}\">OPEN PAGE</a>"
+    if new_label == "UNKNOWN" and old_label in OUT_LABELS:
+        return (f"🟡🟡 <b>POSSIBLE RESTOCK — CHECK NOW!</b> 🟡🟡\n\n"
+                f"<b>{H.escape(s['name'])}</b>\n"
+                f"The \"{old_label.title()}\" sign disappeared but I can't confirm stock.\n"
+                f"💰 {fmt_price(s['price'])} | 🏪 {H.escape(site_of(url))}\n👉 {link}")
+    if old_label == "COMING SOON":
+        return (f"📢 <b>Status changed: COMING SOON → {new_label.title()}</b>\n\n"
+                f"<b>{H.escape(s['name'])}</b>\n"
+                f"💰 {fmt_price(s['price'])} | 🏪 {H.escape(site_of(url))}\n👉 {link}")
+    return None
+
+
 def record(url, info):
     send_alert = send_gone = False
+    change_msg = None
     with lock:
         old = state.get(url, {})
         prev = old.get("in_stock")
         s = {**info, "error": None, "checked": time.time(),
              "last_alert": old.get("last_alert", 0)}
+
+        # Track the page's status. A change must be seen twice in a row before we
+        # report it as "changed / possible restock", to avoid false alarms from half-loaded pages.
+        cur = "IN STOCK" if info["in_stock"] is True else (info.get("label") or "UNKNOWN")
+        confirmed = old.get("confirmed_label")
+        if confirmed is None or cur == confirmed:
+            s["confirmed_label"], s["pending_label"], s["pending_count"] = (
+                confirmed or cur, None, 0)
+        else:
+            cnt = old.get("pending_count", 0) + 1 if old.get("pending_label") == cur else 1
+            if cnt >= 2:
+                if cur != "IN STOCK":
+                    change_msg = (confirmed, cur)
+                s["confirmed_label"], s["pending_label"], s["pending_count"] = cur, None, 0
+            else:
+                s["confirmed_label"], s["pending_label"], s["pending_count"] = (
+                    confirmed, cur, cnt)
+
         if info["in_stock"] and prev is not True and not too_pricey(info):
             send_alert = True
             s["last_alert"] = time.time()
@@ -180,12 +235,15 @@ def record(url, info):
             send_gone = True
         state[url] = s
         snap = dict(s)
-    print(f"[{time.strftime('%H:%M:%S')}] {site_of(url)} | "
-          f"{'IN STOCK' if info['in_stock'] else 'out/unknown'} | {fmt_price(info['price'])}")
+    print(f"[{time.strftime('%H:%M:%S')}] {site_of(url)} | {cur} | {fmt_price(info['price'])}")
     if send_alert:
         telegram(alert_text(url, snap))
     if send_gone:
         telegram(f"❌ Sold out again: <b>{H.escape(snap['name'])}</b> ({H.escape(site_of(url))})")
+    if change_msg:
+        msg = change_text(url, snap, *change_msg)
+        if msg:
+            telegram(msg)
 
 
 def record_error(url, e):
@@ -211,29 +269,48 @@ def repeater():
             telegram(alert_text(url, s, repeat=True))
 
 
+def status_icon(s):
+    return ("✅ IN STOCK" if s["in_stock"] is True else
+            LABEL_TEXT.get(s.get("label")) or
+            ("❌ Out" if s["in_stock"] is False else "⚠️ Unknown"))
+
+
+def report_line(url, s):
+    site = H.escape(site_of(url))
+    link = f"<a href=\"{H.escape(url)}\">{site}</a>"
+    if not s:
+        return f"  ⏳ {link} — not checked yet"
+    err = " (error)" if s.get("error") else ""
+    return f"  {status_icon(s)} — {link}{err}"
+
+
 def report():
     with lock:
         snap = {u: dict(s) for u, s in state.items()}
-    groups = {}
-    for url in PRODUCTS:
-        s = snap.get(url)
-        key = round(s["price"]) if s and s.get("price") else None
-        groups.setdefault(key, []).append((url, s))
     in_count = sum(1 for s in snap.values() if s.get("in_stock") is True)
     lines = [f"📊 <b>PSN status</b> {time.strftime('%H:%M:%S')}  |  "
              f"In stock: <b>{in_count}/{len(PRODUCTS)}</b>"]
+
+    if PRIORITY_URLS:
+        lines.append("\n🎯 <b>PRIORITY WATCH</b>")
+        for url in PRIORITY_URLS:
+            s = snap.get(url)
+            price = fmt_price(s["price"]) if s else ""
+            lines.append(f"  💰 {price}" if s else "")
+            lines.append(report_line(url, s))
+
+    groups = {}
+    for url in PRODUCTS:
+        if url in PRIORITY_URLS:
+            continue
+        s = snap.get(url)
+        key = round(s["price"]) if s and s.get("price") else None
+        groups.setdefault(key, []).append((url, s))
     for key in sorted(groups, key=lambda k: (k is None, k or 0)):
         lines.append(f"\n💰 <b>{'₹{:,}'.format(key) if key else 'Price unknown'}</b>")
         for url, s in groups[key]:
-            site = H.escape(site_of(url))
-            if not s:
-                lines.append(f"  ⏳ <a href=\"{H.escape(url)}\">{site}</a> — not checked yet")
-                continue
-            icon = "✅ IN STOCK" if s["in_stock"] is True else (
-                "❌ Out" if s["in_stock"] is False else "⚠️ Unknown")
-            err = " (error)" if s.get("error") else ""
-            lines.append(f"  {icon} — <a href=\"{H.escape(url)}\">{site}</a>{err}")
-    telegram("\n".join(lines))
+            lines.append(report_line(url, s))
+    telegram("\n".join(l for l in lines if l != ""))
 
 
 def reporter():
@@ -250,15 +327,21 @@ def reporter():
 def plain_worker(url):
     sess = requests.Session()
     sess.headers.update(HEADERS)
+    base = PRIORITY_INTERVAL if url in PRIORITY_URLS else FAST_INTERVAL
+    errors = 0
     while True:
         try:
             r = sess.get(url, timeout=20)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}")
             record(url, check_html(r.text, url))
+            errors = 0
         except Exception as e:
             record_error(url, e)
-        time.sleep(FAST_INTERVAL * random.uniform(0.8, 1.3))
+            errors += 1  # blocked? slow down automatically so we don't get banned
+        wait = base * random.uniform(0.8, 1.3) * min(2 ** errors, 20) if errors else \
+            base * random.uniform(0.8, 1.3)
+        time.sleep(min(wait, 120))
 
 
 def browser_worker(urls):
