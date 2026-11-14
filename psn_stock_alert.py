@@ -228,6 +228,15 @@ def record(url, info):
                 s["confirmed_label"], s["pending_label"], s["pending_count"] = (
                     confirmed, cur, cnt)
 
+        # remember when it was last live and whether it might be restocking
+        s["last_in"] = time.time() if info["in_stock"] is True else old.get("last_in")
+        poss = old.get("possible")
+        if change_msg and change_msg[1] == "UNKNOWN" and change_msg[0] in OUT_LABELS:
+            poss = time.time()
+        elif s["confirmed_label"] in OUT_LABELS or s["confirmed_label"] == "IN STOCK":
+            poss = None
+        s["possible"] = poss
+
         if info["in_stock"] and prev is not True and not too_pricey(info):
             send_alert = True
             s["last_alert"] = time.time()
@@ -269,48 +278,134 @@ def repeater():
             telegram(alert_text(url, s, repeat=True))
 
 
-def status_icon(s):
-    return ("✅ IN STOCK" if s["in_stock"] is True else
-            LABEL_TEXT.get(s.get("label")) or
-            ("❌ Out" if s["in_stock"] is False else "⚠️ Unknown"))
+SITE_NAMES = {
+    "flipkart.com": "Flipkart", "amazon.in": "Amazon", "mdcomputers.in": "MDComputers",
+    "gamestheshop.com": "GamesTheShop", "croma.com": "Croma", "e2zstore.com": "E2Z Store",
+    "stanshop.co": "StanShop", "shop.rooter.gg": "Rooter", "vijaysales.com": "Vijay Sales",
+    "store.jiogames.com": "JioGames",
+}
+RANK = ["🥇", "🥈", "🥉"]
+LINE = "━━━━━━━━━━━━━━━━━━"
+RECENT_LIVE_SECS = 1800  # "was live X min ago" signal window
 
 
-def report_line(url, s):
-    site = H.escape(site_of(url))
-    link = f"<a href=\"{H.escape(url)}\">{site}</a>"
-    if not s:
-        return f"  ⏳ {link} — not checked yet"
-    err = " (error)" if s.get("error") else ""
-    return f"  {status_icon(s)} — {link}{err}"
+def pretty_site(url):
+    d = site_of(url)
+    return SITE_NAMES.get(d, d.split(".")[0].title() if d.count(".") < 2 else d)
+
+
+def link(url, text=None):
+    return f"<a href=\"{H.escape(url)}\">{H.escape(text or pretty_site(url))}</a>"
+
+
+def readable(s):
+    return bool(s) and not s.get("error") and (s.get("in_stock") is not None or s.get("label"))
+
+
+def signal(s):
+    """Why this item might restock soon (None if no signal). Signals are hints, not promises."""
+    if not readable(s) or s.get("in_stock") is True:
+        return None
+    if s.get("label") == "COMING SOON":
+        return "🕒", "coming soon"
+    if s.get("possible"):
+        return "🟠", "sign vanished — CHECK NOW"
+    li = s.get("last_in")
+    if li and time.time() - li < RECENT_LIVE_SECS:
+        return "🔁", f"was live {int((time.time() - li) // 60)}m ago"
+    return None
+
+
+def chip(s):
+    if not readable(s):
+        return "⚪"
+    if s.get("in_stock") is True:
+        return "🟢"
+    return "🟡" if signal(s) else "🔴"
+
+
+def state_text(s):
+    if s.get("in_stock") is True:
+        return "🟢 <b>IN STOCK</b>"
+    sig = signal(s)
+    if sig:
+        return f"🟡 {sig[1]}"
+    return LABEL_TEXT.get(s.get("label")) or "🔴 Out"
+
+
+def ago(s):
+    t = s.get("checked")
+    if not t:
+        return ""
+    sec = int(time.time() - t)
+    return f"{sec}s ago" if sec < 90 else f"{sec // 60}m ago"
 
 
 def report():
     with lock:
         snap = {u: dict(s) for u, s in state.items()}
-    in_count = sum(1 for s in snap.values() if s.get("in_stock") is True)
-    lines = [f"📊 <b>PSN status</b> {time.strftime('%H:%M:%S')}  |  "
-             f"In stock: <b>{in_count}/{len(PRODUCTS)}</b>"]
+    S = {u: snap.get(u) for u in PRODUCTS}
 
+    live = [u for u in PRODUCTS if chip(S[u]) == "🟢"]
+    soon = [u for u in PRODUCTS if chip(S[u]) == "🟡"]
+    out = [u for u in PRODUCTS if chip(S[u]) == "🔴"]
+    unk = [u for u in PRODUCTS if chip(S[u]) == "⚪"]
+
+    L = ["📡 <b>PSN STOCK RADAR</b>",
+         f"🕒 {time.strftime('%H:%M:%S')}",
+         f"🟢 <b>{len(live)}</b> LIVE  ·  🟡 <b>{len(soon)}</b> SOON  ·  "
+         f"🔴 <b>{len(out)}</b> OUT  ·  ⚪ <b>{len(unk)}</b> ?", LINE]
+
+    # 1) in stock now
+    L.append("\n🔥🔥 <b>IN STOCK NOW</b> 🔥🔥")
+    if live:
+        for u in live:
+            L.append(f"✅ <b>{fmt_price(S[u]['price'])}</b> · {link(u)}  ➜ <b>BUY NOW</b>")
+    else:
+        L.append("😴 Nothing live right now")
+
+    # 2) priority watch
     if PRIORITY_URLS:
-        lines.append("\n🎯 <b>PRIORITY WATCH</b>")
-        for url in PRIORITY_URLS:
-            s = snap.get(url)
-            price = fmt_price(s["price"]) if s else ""
-            lines.append(f"  💰 {price}" if s else "")
-            lines.append(report_line(url, s))
+        L.append(f"\n🎯 <b>PRIORITY WATCH</b>  <i>(every {PRIORITY_INTERVAL:g}s)</i>")
+        for i, u in enumerate(PRIORITY_URLS):
+            s = S.get(u)
+            medal = RANK[i] if i < len(RANK) else "▪️"
+            if not s:
+                L.append(f"{medal} {link(u)} — ⏳ starting…")
+            elif not readable(s):
+                L.append(f"{medal} {link(u)} — ⚪ can't read page")
+            else:
+                L.append(f"{medal} <b>{fmt_price(s['price'])}</b> · {link(u)}\n"
+                         f"      {state_text(s)}  <i>· {ago(s)}</i>")
 
+    # 3) restock-soon signals (non-priority; priority ones already shown above)
+    L.append("\n⏳ <b>RESTOCK SOON</b>  <i>(signals, not guarantees)</i>")
+    sig_items = [u for u in soon if u not in PRIORITY_URLS]
+    if sig_items:
+        for u in sig_items:
+            icon, why = signal(S[u])
+            L.append(f"{icon} <b>{fmt_price(S[u]['price'])}</b> · {link(u)} — {why}")
+    else:
+        L.append("📭 No other signals right now")
+
+    # 4) full board: every link, grouped by price
+    L.append("\n📋 <b>ALL STOCK BOARD</b>")
     groups = {}
-    for url in PRODUCTS:
-        if url in PRIORITY_URLS:
-            continue
-        s = snap.get(url)
+    for u in PRODUCTS:
+        s = S[u]
         key = round(s["price"]) if s and s.get("price") else None
-        groups.setdefault(key, []).append((url, s))
+        groups.setdefault(key, []).append(u)
     for key in sorted(groups, key=lambda k: (k is None, k or 0)):
-        lines.append(f"\n💰 <b>{'₹{:,}'.format(key) if key else 'Price unknown'}</b>")
-        for url, s in groups[key]:
-            lines.append(report_line(url, s))
-    telegram("\n".join(l for l in lines if l != ""))
+        seen, cells = {}, []
+        for u in groups[key]:
+            n = pretty_site(u)
+            seen[n] = seen.get(n, 0) + 1
+            cells.append(f"{chip(S[u])} {link(u, n if seen[n] == 1 else f'{n} #{seen[n]}')}")
+        head = f"₹{key:,}" if key else "₹?"
+        L.append(f"<b>{head}</b>  " + "  ".join(cells))
+
+    L += [LINE, "🟢 live  🟡 soon  🔴 out  ⚪ can't read", f"🔁 next update in {REPORT_INTERVAL}s"]
+    telegram("\n".join(L))
 
 
 def reporter():
