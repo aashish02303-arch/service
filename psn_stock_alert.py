@@ -72,6 +72,13 @@ PRIORITY_URLS = list(dict.fromkeys(normalize_url(u) for u in PRIORITY_URLS))
 
 # Some sites block fast checkers. These sites are never checked faster than this (seconds).
 SITE_MIN_INTERVAL = {"flipkart.com": 10, "amazon.in": 10, "croma.com": 15, "vijaysales.com": 10}
+for _pair in re.split(r"[\s,]+", os.getenv("SITE_INTERVALS", "")):
+    if "=" in _pair:
+        _d, _v = _pair.split("=", 1)
+        try:
+            SITE_MIN_INTERVAL[_d.strip()] = float(_v)
+        except ValueError:
+            pass
 
 # Sites that load content with JavaScript -> opened in a real headless browser
 BROWSER_SITES = ["gamestheshop.com"]
@@ -471,9 +478,15 @@ def plain_worker(url):
             base = max(base, floor)
     errors = 0
     while True:
+        retry_after = 0
         try:
             r = sess.get(url, timeout=20)
             if r.status_code != 200:
+                if r.status_code == 429:
+                    try:
+                        retry_after = int(r.headers.get("Retry-After", 0))
+                    except ValueError:
+                        retry_after = 0
                 raise RuntimeError(f"HTTP {r.status_code}")
             tm = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.I | re.S)
             title = re.sub(r"\s+", " ", tm.group(1)).strip() if tm else ""
@@ -491,7 +504,7 @@ def plain_worker(url):
             errors += 1  # blocked? slow down automatically so we don't get banned
         wait = base * random.uniform(0.8, 1.3) * min(2 ** errors, 20) if errors else \
             base * random.uniform(0.8, 1.3)
-        time.sleep(min(wait, 120))
+        time.sleep(min(max(wait, retry_after), 300))
 
 
 def browser_worker(urls):
